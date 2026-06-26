@@ -7,6 +7,7 @@ import {
   Post,
   Body,
   UseGuards,
+  UseFilters,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
@@ -14,6 +15,7 @@ import { ChanceService } from './chance.service';
 import { Chance } from './entities/chance.entity';
 import { ListChancesQueryDto } from './dto/list-chances-query.dto';
 import { PaginatedResponse } from '../../common';
+import { ChanceValidationFilter, ChanceExceptionFilter } from './filters/chance-validation.filter';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -21,6 +23,7 @@ import { Role } from '../auth/enums/role.enum';
 import { CreateChanceDto } from './dto/create-chance.dto';
 
 @Controller('chances')
+@UseFilters(ChanceValidationFilter, ChanceExceptionFilter)
 export class ChanceController {
   constructor(private readonly chanceService: ChanceService) {}
 
