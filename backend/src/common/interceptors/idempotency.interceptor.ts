@@ -6,6 +6,7 @@ import {
   BadRequestException,
   ConflictException,
   HttpStatus,
+  Logger,
 } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Observable, of, throwError } from 'rxjs';
@@ -22,6 +23,8 @@ interface StoredIdempotentResponse {
 
 @Injectable()
 export class IdempotencyInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(IdempotencyInterceptor.name);
+
   constructor(
     private readonly redisService: RedisService,
     private readonly reflector: Reflector,
@@ -71,7 +74,9 @@ export class IdempotencyInterceptor implements NestInterceptor {
       return of(cachedResponse.body);
     }
 
-    // Handle concurrent requests with the same key using a temporary lock
+    // Handle concurrent requests with the same key using a temporary lock.
+    // The lock is set with a TTL so a crashed request cannot deadlock the key
+    // forever; a retry after the TTL can safely re-attempt the operation.
     const lockKey = `${redisKey}:lock`;
     const acquiredLock = await this.redisService.incrementRateLimit(
       lockKey,
@@ -98,6 +103,12 @@ export class IdempotencyInterceptor implements NestInterceptor {
       }),
       catchError((err) => {
         // Release the lock on failure so the client can retry the same key.
+        // Log with the correlation id so money-adjacent failures are traceable.
+        const requestId =
+          request.id || request.headers['x-request-id'] || undefined;
+        this.logger.warn(
+          `Idempotent request failed key=${idempotencyKey} requestId=${requestId} status=${err?.status ?? 'unknown'}`,
+        );
         return this.redisService.del(lockKey).then(() => throwError(() => err));
       }),
     );
