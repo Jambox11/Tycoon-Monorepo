@@ -4,13 +4,21 @@ import {
   ExecutionContext,
   CallHandler,
   BadRequestException,
+  ConflictException,
   HttpStatus,
 } from '@nestjs/common';
-import { Observable, of } from 'rxjs';
-import { tap } from 'rxjs/operators';
+import { createHash } from 'crypto';
+import { Observable, of, throwError } from 'rxjs';
+import { catchError, tap } from 'rxjs/operators';
 import { RedisService } from '../../modules/redis/redis.service';
 import { Reflector } from '@nestjs/core';
 import { IDEMPOTENT_KEY } from '../decorators/idempotent.decorator';
+
+interface StoredIdempotentResponse {
+  statusCode: number;
+  body: any;
+  bodyHash: string;
+}
 
 @Injectable()
 export class IdempotencyInterceptor implements NestInterceptor {
@@ -33,7 +41,8 @@ export class IdempotencyInterceptor implements NestInterceptor {
     }
 
     const request = context.switchToHttp().getRequest();
-    const idempotencyKey = request.headers['x-idempotency-key'];
+    const idempotencyKey =
+      request.headers['x-idempotency-key'] || request.headers['idempotency-key'];
 
     if (!idempotencyKey) {
       // If the decorator is present, we require the key
@@ -43,16 +52,23 @@ export class IdempotencyInterceptor implements NestInterceptor {
     const userId = request.user?.id;
     const redisKey = `idempotency:${userId || 'anon'}:${idempotencyKey}`;
 
+    // Bind the key to the request payload so a replay with a different body
+    // cannot silently return a response for a different purchase.
+    const bodyHash = this.hashBody(request.body);
+
     // Check if we have a cached response
-    const cachedResponse = await this.redisService.get(redisKey);
+    const cachedResponse = (await this.redisService.get(
+      redisKey,
+    )) as StoredIdempotentResponse | null;
     if (cachedResponse) {
-      const { statusCode, body } = cachedResponse as {
-        statusCode: number;
-        body: any;
-      };
+      if (cachedResponse.bodyHash && cachedResponse.bodyHash !== bodyHash) {
+        throw new ConflictException(
+          'Idempotency-Key was already used with a different request payload',
+        );
+      }
       const response = context.switchToHttp().getResponse();
-      response.status(statusCode);
-      return of(body);
+      response.status(cachedResponse.statusCode);
+      return of(cachedResponse.body);
     }
 
     // Handle concurrent requests with the same key using a temporary lock
@@ -62,7 +78,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
       10,
     );
     if (acquiredLock > 1) {
-      throw new BadRequestException(
+      throw new ConflictException(
         'A request with this idempotency key is already in progress',
       );
     }
@@ -75,11 +91,38 @@ export class IdempotencyInterceptor implements NestInterceptor {
         // Cache the response for 24 hours
         await this.redisService.set(
           redisKey,
-          { statusCode, body },
+          { statusCode, body, bodyHash },
           24 * 60 * 60,
         );
         await this.redisService.del(lockKey);
       }),
+      catchError((err) => {
+        // Release the lock on failure so the client can retry the same key.
+        return this.redisService.del(lockKey).then(() => throwError(() => err));
+      }),
     );
+  }
+
+  private hashBody(body: unknown): string {
+    const serialized = this.stableStringify(body ?? null);
+    return createHash('sha256').update(serialized).digest('hex');
+  }
+
+  private stableStringify(value: unknown): string {
+    if (value === null || typeof value !== 'object') {
+      return JSON.stringify(value) ?? 'null';
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableStringify(item)).join(',')}]`;
+    }
+    const entries = Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${this.stableStringify(
+            (value as Record<string, unknown>)[key],
+          )}`,
+      );
+    return `{${entries.join(',')}}`;
   }
 }

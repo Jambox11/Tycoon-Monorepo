@@ -1,4 +1,140 @@
-import { SetMetadata } from '@nestjs/common';
+import {
+  CallHandler,
+  CanActivate,
+  ConflictException,
+  ExecutionContext,
+  Injectable,
+  NestInterceptor,
+  SetMetadata,
+  UseInterceptors,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { createHash } from 'crypto';
+import { Observable, of } from 'rxjs';
+import { tap } from 'rxjs/operators';
 
-export const IDEMPOTENT_KEY = 'is_idempotent';
-export const Idempotent = () => SetMetadata(IDEMPOTENT_KEY, true);
+/**
+ * Marks a route as idempotent. The Idempotency-Key header is required and is
+ * bound to a hash of the request body so that replays return the stored
+ * response while payload conflicts fail closed with 409.
+ *
+ * The authoritative write path is shop-api; this decorator only guards the
+ * backend proxy/read model so it never becomes a second source of truth for
+ * money or inventory.
+ */
+export const IDEMPOTENT_KEY = 'tycoon:idempotent';
+export const IDEMPOTENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface IdempotencyRecord {
+  bodyHash: string;
+  status: number;
+  response: unknown;
+  expiresAt: number;
+}
+
+export interface IdempotencyStore {
+  get(key: string): Promise<IdempotencyRecord | undefined>;
+  set(key: string, record: IdempotencyRecord): Promise<void>;
+}
+
+/**
+ * In-memory fallback store. Production deployments should provide a Redis-backed
+ * implementation via the IDEMPOTENCY_STORE token so replays survive restarts and
+ * are shared across replicas.
+ */
+export const IDEMPOTENCY_STORE = 'tycoon:idempotency-store';
+
+export class InMemoryIdempotencyStore implements IdempotencyStore {
+  private readonly records = new Map<string, IdempotencyRecord>();
+
+  async get(key: string): Promise<IdempotencyRecord | undefined> {
+    const record = this.records.get(key);
+    if (!record) {
+      return undefined;
+    }
+    if (record.expiresAt <= Date.now()) {
+      this.records.delete(key);
+      return undefined;
+    }
+    return record;
+  }
+
+  async set(key: string, record: IdempotencyRecord): Promise<void> {
+    this.records.set(key, record);
+  }
+}
+
+export function hashRequestBody(body: unknown): string {
+  const canonical = JSON.stringify(body ?? null);
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+@Injectable()
+export class IdempotencyInterceptor implements NestInterceptor {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly store: IdempotencyStore,
+  ) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
+    const enabled = this.reflector.getAllAndOverride<boolean>(IDEMPOTENT_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (!enabled) {
+      return next.handle();
+    }
+
+    const request = context.switchToHttp().getRequest();
+    const key = request.headers?.['idempotency-key'];
+
+    if (typeof key !== 'string' || key.trim().length === 0) {
+      throw new ConflictException({
+        code: 'IDEMPOTENCY_KEY_REQUIRED',
+        message: 'Idempotency-Key header is required for this operation.',
+      });
+    }
+
+    const bodyHash = hashRequestBody(request.body);
+    const existing = await this.store.get(key);
+
+    if (existing) {
+      if (existing.bodyHash !== bodyHash) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_PAYLOAD_CONFLICT',
+          message: 'Idempotency-Key was reused with a different payload.',
+        });
+      }
+      return of(existing.response);
+    }
+
+    return next.handle().pipe(
+      tap((response) => {
+        void this.store.set(key, {
+          bodyHash,
+          status: 200,
+          response,
+          expiresAt: Date.now() + IDEMPOTENT_TTL_MS,
+        });
+      }),
+    );
+  }
+}
+
+/**
+ * Route decorator that enforces Idempotency-Key semantics on the wrapped
+ * handler. Requires IdempotencyInterceptor to be registered globally or on the
+ * controller.
+ */
+export function Idempotent(): MethodDecorator & ClassDecorator {
+  return (target: object, key?: string | symbol, descriptor?: PropertyDescriptor) => {
+    if (descriptor) {
+      SetMetadata(IDEMPOTENT_KEY, true)(target, key as string | symbol, descriptor);
+      UseInterceptors(IdempotencyInterceptor)(target, key as string | symbol, descriptor);
+      return;
+    }
+    SetMetadata(IDEMPOTENT_KEY, true)(target);
+    UseInterceptors(IdempotencyInterceptor)(target);
+  };
+}

@@ -3,6 +3,13 @@
 ## Overview
 This runbook covers the operational procedures for managing the Tycoon Shop and Purchases module, including troubleshooting failed transactions, managing coupons, and auditing financial activity.
 
+## Authoritative Write Path
+`shop-api` is the single source of truth for money, inventory, and purchase state.
+The backend `POST /shop/purchase` endpoint is a **proxy/read model only**: it forwards
+the request to `shop-api` and must never mutate balances or inventory itself. Any
+backend-side caching (e.g. `shop:inventory:<USER_ID>`) is a derived read model and
+must be invalidated from `shop-api` responses, never treated as authoritative.
+
 ## Common Issues & Troubleshooting
 
 ### 1. Failed Purchases
@@ -62,6 +69,41 @@ Currently, refunds are handled manually by:
 1.  Removing the item from `user_inventories`.
 2.  Crediting the user's balance (if applicable).
 3.  Logging the action in `audit_trails` with a reason.
+
+## Canary Reconciliation & Rollback (Proxy)
+
+When rolling out a new `shop-api` purchase path behind the backend proxy, use a
+canary and reconcile before promoting. The proxy must fail closed on writes.
+
+### Canary Procedure
+1.  Route a small percentage of `POST /shop/purchase` traffic to the canary via the
+    proxy flag (e.g. `SHOP_PURCHASE_CANARY_PERCENT`). Reads may stay on stable.
+2.  Watch RED metrics for the purchase path: `tycoon_purchases_total` (rate/errors)
+    and latency histograms, split by canary vs stable.
+3.  Reconcile canary vs stable before widening:
+    ```sql
+    SELECT idempotency_key, status, created_at
+    FROM purchases
+    WHERE created_at > now() - interval '1 hour'
+    ORDER BY created_at DESC;
+    ```
+    Confirm no duplicate `idempotency_key` rows and that inventory deltas match
+    successful purchases (inventory must never go negative).
+4.  Widen the canary only after a clean reconciliation window.
+
+### Rollback Procedure
+1.  Set the canary percentage to `0` (or disable the proxy flag) to send all
+    purchase writes back to the stable path. This is the primary rollback lever.
+2.  Do **not** delete idempotency keys during rollback — replaying a key must still
+    return the stored response so clients cannot double-purchase across the switch.
+3.  If the canary wrote partial state, reconcile against `shop-api` (source of truth)
+    and correct the backend read model by invalidating `shop:inventory:<USER_ID>`.
+4.  Record the incident and rollback in `audit_trails` with a reason.
+
+### Fail-Closed Behavior
+If `shop-api` (or its Postgres/Redis dependencies) is unavailable, the proxy must
+return an error and **not** fall back to a local write. Writes fail closed; reads may
+serve stale cached data with a clear degraded indicator.
 
 ## Monitoring & Metrics
 -   **Metric**: `tycoon_purchases_total` - Track successful vs failed purchases.
