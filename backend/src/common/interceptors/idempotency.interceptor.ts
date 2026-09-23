@@ -44,8 +44,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
     }
 
     const request = context.switchToHttp().getRequest();
-    const idempotencyKey =
-      request.headers['x-idempotency-key'] || request.headers['idempotency-key'];
+    const idempotencyKey = this.extractIdempotencyKey(request);
 
     if (!idempotencyKey) {
       // If the decorator is present, we require the key
@@ -112,6 +111,39 @@ export class IdempotencyInterceptor implements NestInterceptor {
         return this.redisService.del(lockKey).then(() => throwError(() => err));
       }),
     );
+  }
+
+  /**
+   * Resolve the idempotency key from the request. HTTP callers use the
+   * X-Idempotency-Key / Idempotency-Key headers, while WS reconnect retries
+   * (roll/buy/end-turn) carry the key on the message payload or handshake
+   * query. Keeping a single resolver guarantees the same key is honored
+   * regardless of transport so duplicate actions are not double-applied.
+   */
+  private extractIdempotencyKey(request: any): string | undefined {
+    const headerKey =
+      request?.headers?.['x-idempotency-key'] ||
+      request?.headers?.['idempotency-key'];
+    if (headerKey) {
+      return Array.isArray(headerKey) ? headerKey[0] : headerKey;
+    }
+
+    const payloadKey =
+      request?.body?.idempotencyKey ||
+      request?.body?.idempotency_key ||
+      request?.data?.idempotencyKey ||
+      request?.data?.idempotency_key;
+    if (payloadKey) {
+      return String(payloadKey);
+    }
+
+    const queryKey =
+      request?.query?.idempotencyKey || request?.query?.idempotency_key;
+    if (queryKey) {
+      return Array.isArray(queryKey) ? queryKey[0] : String(queryKey);
+    }
+
+    return undefined;
   }
 
   private hashBody(body: unknown): string {

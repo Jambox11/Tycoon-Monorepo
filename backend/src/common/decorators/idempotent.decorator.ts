@@ -25,6 +25,24 @@ import { tap } from 'rxjs/operators';
 export const IDEMPOTENT_KEY = 'tycoon:idempotent';
 export const IDEMPOTENT_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Game actions (roll/buy/end-turn) are submitted as intents over the WS
+ * gateway. Reconnect retries and duplicate tabs can replay the same intent, so
+ * the idempotency key is scoped per game action and bound to the acting seat.
+ */
+export const GAME_ACTION_IDEMPOTENCY_SCOPE = 'game-action';
+
+export type GameActionType = 'roll' | 'buy' | 'end-turn';
+
+export interface GameActionIntent {
+  gameId: string;
+  seatId: string;
+  action: GameActionType;
+  /** Client-generated key; stable across reconnect retries of the same intent. */
+  idempotencyKey: string;
+  payload?: unknown;
+}
+
 export interface IdempotencyRecord {
   bodyHash: string;
   status: number;
@@ -67,6 +85,35 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
 export function hashRequestBody(body: unknown): string {
   const canonical = JSON.stringify(body ?? null);
   return createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Builds the store key for a game action intent. The key is namespaced by game
+ * and seat so a spectator or a different seat cannot replay another player's
+ * intent, and so the same client key across games never collides.
+ */
+export function gameActionIdempotencyKey(intent: GameActionIntent): string {
+  return [
+    GAME_ACTION_IDEMPOTENCY_SCOPE,
+    intent.gameId,
+    intent.seatId,
+    intent.action,
+    intent.idempotencyKey,
+  ].join(':');
+}
+
+/**
+ * Canonical hash of a game action intent. Excludes the idempotency key itself
+ * (it is part of the store key) so a replay with the same key and same intent
+ * matches, while a reused key with a different action/payload fails closed.
+ */
+export function hashGameActionIntent(intent: GameActionIntent): string {
+  return hashRequestBody({
+    gameId: intent.gameId,
+    seatId: intent.seatId,
+    action: intent.action,
+    payload: intent.payload ?? null,
+  });
 }
 
 @Injectable()
