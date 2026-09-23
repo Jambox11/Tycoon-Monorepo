@@ -3,6 +3,52 @@
 ## Overview
 This runbook provides guidance for managing game lifecycles, troubleshooting matchmaking issues, and ensuring game state consistency.
 
+## Realtime Transport (ADR-002)
+
+Games are served over a WebSocket gateway on the `/games` namespace. The gateway is the
+single source of truth for realtime turn flow; REST remains available for non-realtime reads.
+
+### Handshake & Authentication (ADR-004)
+-   Clients authenticate during the socket handshake with a JWT supplied via the auth cookie
+    or the `Authorization: Bearer <token>` header. The gateway validates the token with the
+    same secret/issuer as the REST API.
+-   Unauthenticated or expired tokens are rejected at connect time with a `connect_error`
+    carrying `{ code: 'UNAUTHORIZED', requestId }`. Clients must refresh the token and
+    reconnect; the gateway never upgrades an anonymous socket.
+-   If a JWT expires mid-game, the socket is disconnected on the next authenticated event.
+    The client should refresh and rejoin the room (see Reconnect below).
+
+### Rooms & Seat Authorization
+-   Each game maps to a room keyed by `gameId`. On `join`, the gateway verifies the caller
+    holds a seat in that game before adding the socket to the room.
+-   `join` is idempotent: a duplicate join for the same `gameId`/`seat` is a no-op and returns
+    the current room state rather than erroring or double-adding the socket.
+-   Turn actions are authorized against the caller's seat. A `roll` from a socket that does not
+    own the active turn is rejected with `{ code: 'NOT_YOUR_TURN', requestId }`.
+
+### Server-Authoritative Dice
+-   Dice outcomes are generated **only** on the server. Any client-supplied roll value in the
+    payload is ignored and never trusted; the server result is what is broadcast to the room.
+-   Roll events are rate-limited per socket/seat. Excess rolls are rejected with
+    `{ code: 'RATE_LIMITED', requestId }` and counted in `tycoon_games_roll_rejected_total`.
+
+### Payload Schema Version
+-   Every gateway payload includes a `schemaVersion` field. Bump it on any breaking change and
+    keep the gateway tolerant of the previous version during rollout.
+
+### Redis Adapter (Horizontal Scale)
+-   The gateway uses the Redis adapter so events fan out across all instances. Without it,
+    multi-instance deploys drop events for sockets connected to other pods.
+-   On a Redis partition, instances stop receiving cross-pod events. Sockets stay connected but
+    may miss broadcasts; clients recover via reconnect + replay (below). Alert on adapter
+    connection errors and treat sustained partitions as a degraded-realtime incident.
+
+### Reconnect & Idempotency
+-   Reconnect is coordinated with action idempotency keys: clients resend the last mutation with
+    the same `X-Idempotency-Key`, and the server replays the stored result instead of re-rolling.
+-   On reconnect the client rejoins its room; the gateway replays the current authoritative state
+    so the client can reconcile any missed events.
+
 ## Common Issues & Troubleshooting
 
 ### 1. Matchmaking Timeouts
@@ -48,6 +94,8 @@ If AI players are not moving:
 -   **Metric**: `tycoon_games_active_total` - Gauge of currently running games.
 -   **Metric**: `tycoon_matchmaking_duration_seconds` - Histogram of time to match players.
 -   **Metric**: `tycoon_idempotency_hits_total` - Monitor how often replay protection is triggered.
+-   **Metric**: `tycoon_games_roll_rejected_total` - Counter of rejected rolls (off-turn, rate-limited, or client-supplied outcomes).
+-   **Metric**: `tycoon_games_ws_connections_total` - Gauge of active WebSocket connections on `/games`.
 
 ## Support Contacts
 -   Game Logic Team: #team-game-engine
