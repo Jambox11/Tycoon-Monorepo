@@ -69,4 +69,52 @@ describe('GracefulShutdownService', () => {
 
     expect(logger.warn).toHaveBeenCalled();
   });
+
+  it('drains in the documented order: stop accepting work, drain in-flight, close DB/Redis', async () => {
+    const order: string[] = [];
+    const wsAdapter = { close: jest.fn().mockImplementation(async () => { order.push('ws.close'); }) };
+    const dataSource = { destroy: jest.fn().mockImplementation(async () => { order.push('dataSource.destroy'); }) };
+    const redisClient = { quit: jest.fn().mockImplementation(async () => { order.push('redis.quit'); }) };
+
+    service.register(wsAdapter as Drainable);
+    service.register(dataSource as Drainable);
+    service.register(redisClient as Drainable);
+
+    await service.onApplicationShutdown('SIGTERM');
+
+    expect(order).toEqual(['ws.close', 'dataSource.destroy', 'redis.quit']);
+  });
+
+  it('is idempotent: a second shutdown call is a no-op', async () => {
+    const wsAdapter = { close: jest.fn().mockResolvedValue(undefined) };
+    const dataSource = { destroy: jest.fn().mockResolvedValue(undefined) };
+    const redisClient = { quit: jest.fn().mockResolvedValue(undefined) };
+
+    service.register(wsAdapter as Drainable);
+    service.register(dataSource as Drainable);
+    service.register(redisClient as Drainable);
+
+    await service.onApplicationShutdown('SIGTERM');
+    await service.onApplicationShutdown('SIGTERM');
+
+    expect(wsAdapter.close).toHaveBeenCalledTimes(1);
+    expect(dataSource.destroy).toHaveBeenCalledTimes(1);
+    expect(redisClient.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs an error in one step and still runs later steps', async () => {
+    const order: string[] = [];
+    const wsAdapter = { close: jest.fn().mockImplementation(async () => { order.push('ws.close'); }) };
+    const dataSource = { destroy: jest.fn().mockImplementation(async () => { order.push('dataSource.destroy'); throw new Error('db down'); }) };
+    const redisClient = { quit: jest.fn().mockImplementation(async () => { order.push('redis.quit'); }) };
+
+    service.register(wsAdapter as Drainable);
+    service.register(dataSource as Drainable);
+    service.register(redisClient as Drainable);
+
+    await service.onApplicationShutdown('SIGTERM');
+
+    expect(order).toEqual(['ws.close', 'dataSource.destroy', 'redis.quit']);
+    expect(logger.error).toHaveBeenCalled();
+  });
 });
